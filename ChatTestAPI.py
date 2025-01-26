@@ -80,6 +80,8 @@ class ChatRequest(BaseModel):
     message: str
 
 class ChatResponse(BaseModel):
+    session_id: str
+    input: str
     response: str
 
 class SessionStartResponse(BaseModel):
@@ -166,7 +168,11 @@ async def chat_endpoint(request: ChatRequest):
         memory.chat_memory.add_ai_message(ai_response)
         logger.debug(f"Added AI message to session {session_id} memory")
 
-        return {"response": ai_response}
+        return {
+            "session_id": session_id,
+            "input": user_message,
+            "response": ai_response
+        }
 
     except HTTPException as http_exc:
         # Specific HTTP exceptions are logged at warning level
