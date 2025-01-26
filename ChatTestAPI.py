@@ -86,6 +86,17 @@ class ChatResponse(BaseModel):
 
 class SessionStartResponse(BaseModel):
     session_id: str
+    
+# =======================
+# Pydantic Models for Delete Chat
+# =======================
+class DeleteRequest(BaseModel):
+    session_id: str
+
+class DeleteResponse(BaseModel):
+    detail: str
+    session_id: str
+    remaining_sessions: int
 
 # =======================
 # Exception Handling
@@ -182,6 +193,62 @@ async def chat_endpoint(request: ChatRequest):
         # General exceptions are logged with stack trace
         logger.exception(f"Error processing chat for session {session_id}")
         raise HTTPException(status_code=500, detail="Failed to process chat message")
+    
+# =======================
+# Delete Endpoint
+# =======================
+@app.delete("/delete-session", response_model=DeleteResponse)
+async def delete_session(request: DeleteRequest):
+    """
+    Deletes a chat session and its associated memory
+    """
+    session_id = request.session_id
+    logger.info(f"Delete request initiated for session: {session_id}")
+    
+    try:
+        # Validate session existence
+        if session_id not in sessions:
+            logger.warning(f"Delete attempt for non-existent session: {session_id}")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session {session_id} not found",
+                headers={"X-Session-Status": "not_found"}
+            )
+
+        # Perform deletion
+        del sessions[session_id]
+        remaining = len(sessions)
+        
+        logger.info(f"Successfully deleted session: {session_id}")
+        logger.debug(f"Remaining active sessions: {remaining}")
+        
+        return {
+            "detail": "Session deleted successfully",
+            "session_id": session_id,
+            "remaining_sessions": remaining
+        }
+
+    except HTTPException as http_exc:
+        logger.error(f"Deletion failed for session {session_id}: {http_exc.detail}")
+        raise http_exc
+        
+    except KeyError as ke:
+        error_msg = f"Session key error: {str(ke)}"
+        logger.error(error_msg)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error during deletion",
+            headers={"X-Error-Type": "key_error"}
+        )
+        
+    except Exception as e:
+        error_msg = f"Unexpected error deleting session {session_id}: {str(e)}"
+        logger.exception(error_msg)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error",
+            headers={"X-Error-Type": "unexpected_error"}
+        )
 
 # =======================
 # Application Startup
