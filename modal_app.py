@@ -1,11 +1,25 @@
 import os
 import uuid
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import time
 from typing import Dict, Optional
 
+import openai
+import pinecone
+from fastapi import FastAPI, HTTPException, Request, Depends, status
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, validator
+
+from cerebras.cloud.sdk import Cerebras
+from langchain.memory import ConversationBufferMemory
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Pinecone
+from langchain.chains import ConversationalRetrievalChain
+
+import Prompts
 import modal
-from pydantic import BaseModel
 
 # =======================
 # Define the FastAPI Image
@@ -56,12 +70,12 @@ with asgi_image.imports():
     )
     from utilities.IMSHandler import IMSQueryHandler
     import Prompts
-    from dotenv import load_dotenv
+    # from dotenv import load_dotenv
 
 # =======================
 # Load Environment Variables
 # =======================
-load_dotenv()
+# load_dotenv()
 
 # =======================
 # Configure Logging
@@ -117,19 +131,26 @@ except Exception as e:
 # Initialize Pinecone
 # =======================
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")  # e.g., 'us-west1-gcp'
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")  # e.g., 'us-west1-gcp'
 
 if not PINECONE_API_KEY or not PINECONE_ENVIRONMENT:
     logger.critical("API keys and Pinecone environment must be set as environment variables.")
     raise ValueError("API keys and Pinecone environment must be set as environment variables.")
 
 try:
-    pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+    # Instantiate the Pinecone client
+    pinecone_client = Pinecone(
+        api_key=PINECONE_API_KEY,
+        environment=PINECONE_ENVIRONMENT
+    )
     logger.info("Pinecone initialized successfully.")
 except Exception as e:
     logger.critical(f"Failed to initialize Pinecone: {e}", exc_info=True)
     raise e
+
+openai.api_key = OPENAI_API_KEY
 
 # =======================
 # In-Memory Session Storage
