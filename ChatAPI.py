@@ -7,15 +7,22 @@ from typing import Dict
 
 import openai
 import pinecone
-from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, validator
 
 from cerebras.cloud.sdk import Cerebras
 from langchain.memory import ConversationBufferMemory
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import Pinecone
+from langchain.chains import ConversationalRetrievalChain
 
 import Prompts
+
+# Load environment variables from a .env file if present
+from dotenv import load_dotenv
+load_dotenv()
 
 # Configure logging
 LOG_DIR = os.path.abspath("logs")
@@ -49,18 +56,18 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(detailed_formatter)
 logger.addHandler(console_handler)
 
-app = FastAPI()
+app = FastAPI(title="Text to Pinecone Vector Store API")
 
 # Initialize OpenAI and Pinecone API keys from environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")  # e.g., 'us-west1-gcp'
 
+openai.api_key = OPENAI_API_KEY
+
 if not OPENAI_API_KEY or not PINECONE_API_KEY or not PINECONE_ENVIRONMENT:
     logger.critical("API keys and Pinecone environment must be set as environment variables.")
     raise ValueError("API keys and Pinecone environment must be set as environment variables.")
-
-openai.api_key = OPENAI_API_KEY
 
 try:
     pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
@@ -74,13 +81,13 @@ except Exception as e:
 # =======================
 
 # Fetch API key from environment variables
-api_key = os.environ.get("CEREBRAS_API_KEY")
-if not api_key:
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+if not CEREBRAS_API_KEY:
     logger.error("CEREBRAS_API_KEY environment variable not set")
     raise EnvironmentError("CEREBRAS_API_KEY environment variable not set")
 
 try:
-    client = Cerebras(api_key=api_key)
+    client = Cerebras(api_key=CEREBRAS_API_KEY)
     logger.info("Cerebras client initialized successfully")
 except Exception as e:
     logger.exception("Failed to initialize Cerebras client")
@@ -91,7 +98,35 @@ except Exception as e:
 # =======================
 
 # Note: For production, replace with a persistent database
-sessions: Dict[str, ConversationBufferMemory] = {}
+sessions: Dict[str, Dict] = {}
+
+# =======================
+# Cerebras LLM Wrapper
+# =======================
+
+class CerebrasLLM:
+    def __init__(self, client, model):
+        self.client = client
+        self.model = model
+
+    def __call__(self, prompt):
+        try:
+            response = self.client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": Prompts.SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                model=self.model,
+            )
+            ai_response = response.choices[0].message.content
+            logger.debug(f"Cerebras AI response: {ai_response}")
+            return ai_response
+        except openai.error.OpenAIError as e:
+            logger.error(f"OpenAI API error: {e}", exc_info=True)
+            raise OpenAIServiceError("Failed to generate AI response.")
+        except Exception as e:
+            logger.exception(f"Unexpected error in CerebrasLLM: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate AI response.")
 
 # Pydantic Models
 class TextInput(BaseModel):
@@ -112,6 +147,17 @@ class DeleteVectorStoreResponse(BaseModel):
     index_name: str
     
 # =======================
+# Pydantic Models for Session
+# =======================
+
+class SessionStartRequest(BaseModel):
+    # Optional: Add any parameters needed for session initialization
+    pass
+
+class SessionStartResponse(BaseModel):
+    session_id: str
+    
+# =======================
 # Pydantic Models for Chat
 # =======================
 
@@ -123,9 +169,6 @@ class ChatResponse(BaseModel):
     session_id: str
     input: str
     response: str
-
-class SessionStartResponse(BaseModel):
-    session_id: str
     
 # =======================
 # Pydantic Models for Delete Chat
@@ -137,6 +180,21 @@ class DeleteResponse(BaseModel):
     detail: str
     session_id: str
     remaining_sessions: int
+    
+# =======================
+# Pydantic Models for RAG Chat
+# =======================
+    
+class ChatRagRequest(BaseModel):
+    session_id: str
+    vectorstore_id: str
+    message: str
+
+class ChatRagResponse(BaseModel):
+    session_id: str
+    vectorstore_id: str
+    input: str
+    response: str
 
 # Custom Exception Classes
 class PineconeIndexNotFoundError(HTTPException):
@@ -160,7 +218,10 @@ class OpenAIServiceError(HTTPException):
             detail=detail
         )
 
+# =======================
 # Helper Functions
+# =======================
+
 def retry_operation(operation, retries=3, delay=2):
     """
     Retry an operation multiple times with delay.
@@ -176,6 +237,52 @@ def retry_operation(operation, retries=3, delay=2):
         status_code=status.HTTP_502_BAD_GATEWAY,
         detail="External service is unavailable. Please try again later."
     )
+
+def load_vectorstore(vectorstore_id: str):
+    """
+    Load a Pinecone vector store based on the vectorstore_id.
+    """
+    try:
+        if vectorstore_id not in pinecone.list_indexes():
+            logger.error(f"Pinecone index '{vectorstore_id}' does not exist.")
+            raise PineconeIndexNotFoundError(vectorstore_id)
+        
+        embeddings = OpenAIEmbeddings()
+        vector_store = Pinecone.from_existing_index(vectorstore_id, embeddings)
+        logger.info(f"Pinecone vector store '{vectorstore_id}' loaded successfully.")
+        return vector_store
+    except PineconeIndexNotFoundError:
+        raise
+    except pinecone.PineconeException as e:
+        logger.error(f"Pinecone service error while loading index '{vectorstore_id}': {e}", exc_info=True)
+        raise PineconeServiceError("Failed to load Pinecone vector store.")
+    except Exception as e:
+        logger.exception(f"Unexpected error while loading vector store '{vectorstore_id}': {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to load vector store.")
+
+def create_qa_chain(vector_store):
+    """
+    Create a ConversationalRetrievalChain with the provided vector store.
+    """
+    try:
+        # Initialize conversation memory
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        
+        # Initialize Cerebras LLM
+        cerebras_llm = CerebrasLLM(client=client, model="llama3.1-8b")
+        
+        # Initialize RAG pipeline
+        qa_chain = ConversationalRetrievalChain.from_llm(
+            llm=cerebras_llm,
+            retriever=vector_store.as_retriever(),
+            memory=memory,
+            verbose=True,
+        )
+        logger.info("ConversationalRetrievalChain initialized successfully.")
+        return qa_chain
+    except Exception as e:
+        logger.exception(f"Failed to create QA chain: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to initialize QA chain.")
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
     """
@@ -337,28 +444,12 @@ def delete_vector_store(request: DeleteVectorStoreRequest):
     except Exception as e:
         logger.error(f"Unexpected error while deleting index '{index_name}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred while deleting the index.")
-
+    
 # =======================
-# Exception Handling
+# Start-Session Endpoint
 # =======================
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    """
-    Handles all uncaught exceptions, logs them, and returns a standardized error response.
-    """
-    logger.exception(f"Unhandled exception for request {request.url}: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal Server Error"},
-    )
-
-# =======================
-# API Endpoints
-# =======================
-
 @app.post("/start-session", response_model=SessionStartResponse)
-async def start_session():
+async def start_session(request: SessionStartRequest):
     """
     Initializes a new chat session with a unique ID.
     """
@@ -366,13 +457,18 @@ async def start_session():
         session_id = str(uuid.uuid4())
         memory = ConversationBufferMemory()
         memory.chat_memory.add_ai_message(Prompts.SYSTEM_PROMPT)
-        sessions[session_id] = memory
+        sessions[session_id] = {
+            "memory": memory
+        }
         logger.info(f"Started new session with ID: {session_id}")
         return {"session_id": session_id}
     except Exception as e:
         logger.exception("Error starting new session")
         raise HTTPException(status_code=500, detail="Failed to start session")
-
+    
+# =======================
+# Chat Endpoint
+# =======================
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     """
@@ -388,7 +484,7 @@ async def chat_endpoint(request: ChatRequest):
         logger.warning(f"Session ID not found: {session_id}")
         raise HTTPException(status_code=404, detail="Session not found")
 
-    memory = sessions[session_id]
+    memory = sessions[session_id]["memory"]
 
     try:
         # Add user message to memory
@@ -435,6 +531,69 @@ async def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=500, detail="Failed to process chat message")
     
 # =======================
+# RAG Chat Endpoint
+# =======================
+@app.post("/chat-rag", response_model=ChatRagResponse)
+async def chat_rag_endpoint(request: ChatRagRequest):
+    """
+    Processes a chat message with RAG using a specified vector store and returns an AI response.
+    """
+    session_id = request.session_id
+    vectorstore_id = request.vectorstore_id
+    user_message = request.message
+
+    logger.debug(f"Received RAG message for session {session_id} with vectorstore_id {vectorstore_id}: {user_message}")
+
+    # Validate session ID
+    if session_id not in sessions:
+        logger.warning(f"Session ID not found: {session_id}")
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    memory = sessions[session_id]["memory"]
+
+    try:
+        # Load the specified vector store with retry
+        vector_store = retry_operation(lambda: load_vectorstore(vectorstore_id))
+
+        # Create QA chain with the loaded vector store
+        qa_chain = create_qa_chain(vector_store)
+
+        # Update the session's memory with the QA chain's memory
+        # This ensures that the conversation history is maintained
+        # You may need to adjust based on how your ConversationBufferMemory is implemented
+        # For simplicity, we're assuming it's already linked
+
+        # Generate AI response using the QA chain
+        result = qa_chain({"question": user_message})
+        ai_response = result["answer"]
+        logger.debug(f"AI response for session {session_id} with RAG: {ai_response}")
+
+        # Add AI response to memory
+        memory.chat_memory.add_ai_message(ai_response)
+        logger.debug(f"Added AI message to session {session_id} memory")
+
+        return ChatRagResponse(
+            session_id=session_id,
+            vectorstore_id=vectorstore_id,
+            input=user_message,
+            response=ai_response
+        )
+
+    except PineconeIndexNotFoundError as e:
+        raise e
+    except PineconeServiceError as e:
+        raise e
+    except OpenAIServiceError as e:
+        raise e
+    except HTTPException as he:
+        # Re-raise HTTP exceptions to be handled by FastAPI
+        logger.error(f"HTTPException: {he.detail}", exc_info=True)
+        raise he
+    except Exception as e:
+        logger.exception(f"Unexpected error in chat_rag_endpoint for session {session_id}")
+        raise HTTPException(status_code=500, detail="Failed to process chat message with RAG")
+    
+# =======================
 # Delete Endpoint
 # =======================
 @app.delete("/delete-session", response_model=DeleteResponse)
@@ -462,11 +621,11 @@ async def delete_session(request: DeleteRequest):
         logger.info(f"Successfully deleted session: {session_id}")
         logger.debug(f"Remaining active sessions: {remaining}")
         
-        return {
-            "detail": "Session deleted successfully",
-            "session_id": session_id,
-            "remaining_sessions": remaining
-        }
+        return DeleteResponse(
+            detail=f"Session '{session_id}' has been deleted successfully.",
+            session_id=session_id,
+            remaining_sessions=remaining
+        )
 
     except HTTPException as http_exc:
         logger.error(f"Deletion failed for session {session_id}: {http_exc.detail}")

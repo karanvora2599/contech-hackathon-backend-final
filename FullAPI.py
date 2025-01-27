@@ -12,7 +12,6 @@ from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-import uvicorn
 
 import docx2txt
 import fitz  # PyMuPDF for reading PDFs
@@ -21,7 +20,6 @@ import PyPDF2
 import pikepdf
 from PIL import Image, ImageEnhance, ImageFilter
 
-import ollama
 from pytesseract import image_to_string, pytesseract
 import httpx  # For making internal HTTP requests
 import json
@@ -145,8 +143,8 @@ credentials = {
 }
 
 # Define prompts or other constants if needed
-class Prompts:
-    DOCUMENT_SYSTEM_PROMPT = "You are a helpful assistant that parses documents into structured JSON."
+# class Prompts:
+#     DOCUMENT_SYSTEM_PROMPT = "You are a helpful assistant that parses documents into structured JSON."
     
 # =============================
 # Utility Functions
