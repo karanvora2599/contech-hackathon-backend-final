@@ -3,7 +3,7 @@ import uuid
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 import openai
 import pinecone
@@ -109,11 +109,13 @@ class CerebrasLLM:
         self.client = client
         self.model = model
 
-    def __call__(self, prompt):
+    def __call__(self, prompt: str, system_prompt: Optional[str] = None):
+        # Use the provided system prompt or fallback to the default
+        system_content = system_prompt if system_prompt else Prompts.SYSTEM_PROMPT
         try:
             response = self.client.chat.completions.create(
                 messages=[
-                    {"role": "system", "content": Prompts.SYSTEM_PROMPT},
+                    {"role": "system", "content": system_content},
                     {"role": "user", "content": prompt},
                 ],
                 model=self.model,
@@ -127,6 +129,17 @@ class CerebrasLLM:
         except Exception as e:
             logger.exception(f"Unexpected error in CerebrasLLM: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate AI response.")
+
+class CustomConversationalRetrievalChain(ConversationalRetrievalChain):
+    def __init__(self, llm, retriever, memory, system_prompt: Optional[str] = None, **kwargs):
+        super().__init__(llm=llm, retriever=retriever, memory=memory, **kwargs)
+        self.system_prompt = system_prompt
+
+    def _call(self, inputs, run_manager=None):
+        # Override the _call method to inject the custom system prompt
+        if self.system_prompt:
+            self.llm.system_prompt = self.system_prompt
+        return super()._call(inputs, run_manager)
 
 # Pydantic Models
 class TextInput(BaseModel):
@@ -164,6 +177,13 @@ class SessionStartResponse(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+    system_prompt: Optional[str] = None  # Optional system prompt
+
+    @validator('system_prompt')
+    def validate_system_prompt(cls, v):
+        if v and len(v) > 1000:
+            raise ValueError("System prompt must be 1000 characters or fewer.")
+        return v
 
 class ChatResponse(BaseModel):
     session_id: str
@@ -189,6 +209,25 @@ class ChatRagRequest(BaseModel):
     session_id: str
     vectorstore_id: str
     message: str
+    system_prompt: Optional[str] = None  # Optional system prompt
+
+    @validator('vectorstore_id')
+    def validate_vectorstore_id(cls, v):
+        if not v.startswith("text-vector-store-"):
+            raise ValueError("Invalid vectorstore_id format.")
+        return v
+
+    @validator('message')
+    def validate_message(cls, v):
+        if len(v) > 1000:
+            raise ValueError("Message length exceeds 1000 characters.")
+        return v
+
+    @validator('system_prompt')
+    def validate_system_prompt(cls, v):
+        if v and len(v) > 1000:
+            raise ValueError("System prompt must be 1000 characters or fewer.")
+        return v
 
 class ChatRagResponse(BaseModel):
     session_id: str
@@ -260,25 +299,26 @@ def load_vectorstore(vectorstore_id: str):
         logger.exception(f"Unexpected error while loading vector store '{vectorstore_id}': {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to load vector store.")
 
-def create_qa_chain(vector_store):
+def create_qa_chain(vector_store, system_prompt: Optional[str] = None):
     """
-    Create a ConversationalRetrievalChain with the provided vector store.
+    Create a CustomConversationalRetrievalChain with the provided vector store and optional system prompt.
     """
     try:
         # Initialize conversation memory
         memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-        
-        # Initialize Cerebras LLM
+
+        # Initialize Cerebras LLM with optional system prompt
         cerebras_llm = CerebrasLLM(client=client, model="llama3.1-8b")
-        
-        # Initialize RAG pipeline
-        qa_chain = ConversationalRetrievalChain.from_llm(
+
+        # Initialize custom RAG pipeline
+        qa_chain = CustomConversationalRetrievalChain.from_llm(
             llm=cerebras_llm,
             retriever=vector_store.as_retriever(),
             memory=memory,
+            system_prompt=system_prompt,
             verbose=True,
         )
-        logger.info("ConversationalRetrievalChain initialized successfully.")
+        logger.info("Custom ConversationalRetrievalChain initialized successfully.")
         return qa_chain
     except Exception as e:
         logger.exception(f"Failed to create QA chain: {e}")
@@ -473,11 +513,18 @@ async def start_session(request: SessionStartRequest):
 async def chat_endpoint(request: ChatRequest):
     """
     Processes a chat message and returns an AI response.
+    Optionally accepts a custom system prompt.
     """
     session_id = request.session_id
     user_message = request.message
+    system_prompt = request.system_prompt  # Optional system prompt
 
     logger.debug(f"Received message for session {session_id}: {user_message}")
+
+    if system_prompt:
+        logger.debug(f"Using custom system prompt for session {session_id}: {system_prompt}")
+    else:
+        logger.debug(f"Using default system prompt for session {session_id}: {Prompts.SYSTEM_PROMPT}")
 
     # Validate session ID
     if session_id not in sessions:
@@ -492,17 +539,20 @@ async def chat_endpoint(request: ChatRequest):
         logger.debug(f"Added user message to session {session_id} memory")
 
         # Get conversation history
-        history = memory.load_memory_variables({}).get("history", "")
+        history = memory.load_memory_variables({}).get("chat_history", "")
         logger.debug(f"Loaded history for session {session_id}: {history}")
 
         # Create prompt with history
         prompt = f"{history}\nUser: {user_message}\nAI:"
         logger.debug(f"Generated prompt for Cerebras: {prompt}")
 
+        # Determine which system prompt to use
+        current_system_prompt = system_prompt if system_prompt else Prompts.SYSTEM_PROMPT
+
         # Get AI response from Cerebras
         response = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": Prompts.SYSTEM_PROMPT},
+                {"role": "system", "content": current_system_prompt},
                 {"role": "user", "content": prompt},
             ],
             model="llama3.1-8b",
@@ -537,10 +587,12 @@ async def chat_endpoint(request: ChatRequest):
 async def chat_rag_endpoint(request: ChatRagRequest):
     """
     Processes a chat message with RAG using a specified vector store and returns an AI response.
+    Optionally accepts a custom system prompt.
     """
     session_id = request.session_id
     vectorstore_id = request.vectorstore_id
     user_message = request.message
+    system_prompt = request.system_prompt  # Optional system prompt
 
     logger.debug(f"Received RAG message for session {session_id} with vectorstore_id {vectorstore_id}: {user_message}")
 
@@ -558,10 +610,11 @@ async def chat_rag_endpoint(request: ChatRagRequest):
         # Create QA chain with the loaded vector store
         qa_chain = create_qa_chain(vector_store)
 
-        # Update the session's memory with the QA chain's memory
-        # This ensures that the conversation history is maintained
-        # You may need to adjust based on how your ConversationBufferMemory is implemented
-        # For simplicity, we're assuming it's already linked
+        # Modify the chain's system prompt if a custom one is provided
+        if system_prompt:
+            # Assuming the chain has a method to set system prompt dynamically
+            qa_chain.llm.system_prompt = system_prompt
+            logger.debug(f"Custom system prompt set for session {session_id}")
 
         # Generate AI response using the QA chain
         result = qa_chain({"question": user_message})
