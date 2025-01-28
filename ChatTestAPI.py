@@ -16,7 +16,7 @@ from pydantic import BaseModel, validator
 from cerebras.cloud.sdk import Cerebras
 from langchain.memory import ConversationBufferMemory
 from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import Pinecone
+from langchain.vectorstores import Pinecone as LangchainPinecone
 from langchain.chains import ConversationalRetrievalChain
 
 import Prompts
@@ -199,17 +199,43 @@ def retry_operation(operation, retries=3, delay=2):
         detail="External service is unavailable. Please try again later."
     )
 
+# def load_vectorstore(vectorstore_id: str):
+#     """
+#     Load a Pinecone vector store based on the vectorstore_id.
+#     """
+#     try:
+#         if vectorstore_id not in pinecone.list_indexes():
+#             logger.error(f"Pinecone index '{vectorstore_id}' does not exist.")
+#             raise PineconeIndexNotFoundError(vectorstore_id)
+        
+#         embeddings = OpenAIEmbeddings()
+#         vector_store = Pinecone.from_existing_index(vectorstore_id, embeddings)
+#         logger.info(f"Pinecone vector store '{vectorstore_id}' loaded successfully.")
+#         return vector_store
+#     except PineconeIndexNotFoundError:
+#         raise
+#     except pinecone.PineconeException as e:
+#         logger.error(f"Pinecone service error while loading index '{vectorstore_id}': {e}", exc_info=True)
+#         raise PineconeServiceError("Failed to load Pinecone vector store.")
+#     except Exception as e:
+#         logger.exception(f"Unexpected error while loading vector store '{vectorstore_id}': {e}")
+#         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to load vector store.")
+
 def load_vectorstore(vectorstore_id: str):
     """
     Load a Pinecone vector store based on the vectorstore_id.
     """
     try:
-        if vectorstore_id not in pinecone.list_indexes():
+        if vectorstore_id not in pc.list_indexes():
             logger.error(f"Pinecone index '{vectorstore_id}' does not exist.")
             raise PineconeIndexNotFoundError(vectorstore_id)
         
         embeddings = OpenAIEmbeddings()
-        vector_store = Pinecone.from_existing_index(vectorstore_id, embeddings)
+        vector_store = LangchainPinecone.from_existing_index(
+            index_name=vectorstore_id,
+            embedding=embeddings,
+            client=pc  # Pass the Pinecone client instance if required
+        )
         logger.info(f"Pinecone vector store '{vectorstore_id}' loaded successfully.")
         return vector_store
     except PineconeIndexNotFoundError:
