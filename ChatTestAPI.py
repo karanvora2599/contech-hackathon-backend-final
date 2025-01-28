@@ -3,9 +3,11 @@ import uuid
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from typing import Dict
+import time
 
 import openai
 import pinecone
+from pinecone import Pinecone, ServerlessSpec  # Updated import
 from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -85,18 +87,22 @@ sessions: Dict[str, Dict] = {}
 # =======================
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_ENV = os.getenv("PINECONE_ENV", "us-west1-gcp")
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")  # e.g., 'us-west1-gcp'
 
-if not PINECONE_API_KEY or not PINECONE_ENV:
+if not PINECONE_API_KEY or not PINECONE_ENVIRONMENT:
     logger.critical("PINECONE_API_KEY and PINECONE_ENV environment variables must be set.")
     raise EnvironmentError("PINECONE_API_KEY and PINECONE_ENV environment variables must be set.")
 
 try:
-    pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENV)
+    # Initialize Pinecone using the new Pinecone class
+    pc = Pinecone(
+        api_key=PINECONE_API_KEY,
+        environment=PINECONE_ENVIRONMENT
+    )
     logger.info("Pinecone initialized successfully.")
 except Exception as e:
     logger.critical(f"Failed to initialize Pinecone: {e}", exc_info=True)
-    raise e
+    raise
 
 # =======================
 # Pydantic Models for Session
