@@ -4,13 +4,16 @@ import os
 import uuid
 import logging
 import time
-from typing import Dict
+from typing import Dict, Any
 
 import openai
-import pinecone
+from openai import OpenAIError  # Correctly import OpenAIError
+from pinecone import Pinecone, ServerlessSpec  # Updated import
+from pinecone.exceptions import PineconeException  # Import PineconeException
 from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 
 # Load environment variables from a .env file if present
 from dotenv import load_dotenv
@@ -33,16 +36,20 @@ app = FastAPI(title="Text to Pinecone Vector Store API")
 # Initialize OpenAI and Pinecone API keys from environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")  # e.g., 'us-west1-gcp'
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")  # e.g., 'us-west1-gcp'
 
 if not OPENAI_API_KEY or not PINECONE_API_KEY or not PINECONE_ENVIRONMENT:
     logger.critical("API keys and Pinecone environment must be set as environment variables.")
     raise ValueError("API keys and Pinecone environment must be set as environment variables.")
 
-openai.api_key = OPENAI_API_KEY
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 try:
-    pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+    # Initialize Pinecone using the new Pinecone class
+    pc = Pinecone(
+        api_key=PINECONE_API_KEY,
+        environment=PINECONE_ENVIRONMENT
+    )
     logger.info("Pinecone initialized successfully.")
 except Exception as e:
     logger.critical(f"Failed to initialize Pinecone: {e}", exc_info=True)
@@ -57,7 +64,7 @@ class TextInput(BaseModel):
 class VectorStoreResponse(BaseModel):
     index_name: str
     dimension: int
-    metadata: Dict[str, str]
+    metadata: Dict[str, Any]
 
 class DeleteVectorStoreRequest(BaseModel):
     index_name: str
@@ -96,7 +103,7 @@ def retry_operation(operation, retries=3, delay=2):
     for attempt in range(retries):
         try:
             return operation()
-        except (pinecone.PineconeException, openai.error.OpenAIError) as e:
+        except (PineconeException, openai.APIError) as e:  # Updated exception
             logger.warning(f"Attempt {attempt + 1} failed with error: {e}. Retrying in {delay} seconds...")
             time.sleep(delay)
     logger.error(f"All {retries} attempts failed.")
@@ -124,23 +131,24 @@ def generate_embeddings(text_chunks):
     Generate embeddings for each text chunk using OpenAI.
     """
     embeddings = []
-    for i, chunk in enumerate(text_chunks):
-        try:
-            response = openai.Embedding.create(
-                input=chunk,
-                model="text-embedding-ada-002"
-            )
-            embedding = response['data'][0]['embedding']
-            embeddings.append(embedding)
-            logger.debug(f"Generated embedding for chunk {i}.")
-        except openai.error.OpenAIError as e:
-            logger.error(f"OpenAI API error for chunk {i}: {e}", exc_info=True)
-            raise OpenAIServiceError("Failed to generate embeddings.")
-        except Exception as e:
-            logger.error(f"Unexpected error during embedding generation for chunk {i}: {e}", exc_info=True)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred during embedding generation.")
-    logger.info("All embeddings generated successfully.")
-    return embeddings
+    try:
+        # Batch process all chunks at once
+        response = openai_client.embeddings.create(
+            input=text_chunks,
+            model="text-embedding-ada-002"
+        )
+        embeddings = [embedding.embedding for embedding in response.data]
+        logger.info(f"Generated {len(embeddings)} embeddings successfully.")
+        return embeddings
+    except openai.APIError as e:
+        logger.error(f"OpenAI API error: {e}", exc_info=True)
+        raise OpenAIServiceError("Failed to generate embeddings.")
+    except Exception as e:
+        logger.error(f"Unexpected error during embedding generation: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred during embedding generation."
+        )
 
 # Exception Handler for Validation Errors
 @app.exception_handler(HTTPException)
@@ -182,29 +190,38 @@ def create_vector_store(input: TextInput):
         embeddings = retry_operation(generate)
 
         # Step 3: Create a unique index name
-        unique_id = str(uuid.uuid4())
-        index_name = f"text-vector-store-{unique_id}"
-        logger.debug(f"Generated unique index name: {index_name}")
+        unique_id = str(uuid.uuid4()).replace("-", "")[:12]  # Take first 12 characters of UUID
+        index_name = f"vecstore{unique_id}".lower()  # Ensure all lowercase
+        logger.debug(f"Generated valid index name: {index_name}")
 
         # Step 4: Create Pinecone index with retry
         def create_pinecone_index():
-            if index_name not in pinecone.list_indexes():
-                pinecone.create_index(index_name, dimension=1536)  # Ada embeddings have 1536 dimensions
-                logger.info(f"Pinecone index '{index_name}' created.")
+            if index_name not in pc.list_indexes().names():
+                pc.create_index(
+                    name=index_name,
+                    dimension=1536,
+                    metric='cosine',  # Recommended for text embeddings
+                    spec=ServerlessSpec(
+                        cloud='aws',
+                        region=PINECONE_ENVIRONMENT
+                    )
+                )
+                logger.info(f"Created Pinecone index: {index_name}")
             else:
-                logger.warning(f"Pinecone index '{index_name}' already exists.")
+                logger.warning(f"Index {index_name} already exists")
         retry_operation(create_pinecone_index)
 
-        index = pinecone.Index(index_name)
+        index = pc.Index(index_name)
 
         # Step 5: Prepare data for Pinecone
-        vectors = []
-        for i, (chunk, embedding) in enumerate(zip(text_chunks, embeddings)):
-            vectors.append((
-                f"chunk_{i}",
-                embedding,
-                {"text": chunk}
-            ))
+        vectors = [
+                    (
+                        f"chunk_{i}",  # Unique ID
+                        embedding,      # The embedding vector
+                        {"text": chunk} # Metadata
+                    )
+                    for i, (chunk, embedding) in enumerate(zip(text_chunks, embeddings))
+                ]
         logger.debug(f"Prepared {len(vectors)} vectors for upsert.")
 
         # Step 6: Upsert vectors into Pinecone with retry
@@ -242,14 +259,14 @@ def delete_vector_store(request: DeleteVectorStoreRequest):
     
     try:
         def check_index_exists():
-            if index_name not in pinecone.list_indexes():
+            if index_name not in pc.list_indexes().names():
                 logger.warning(f"Pinecone index '{index_name}' not found.")
                 raise PineconeIndexNotFoundError(index_name)
         retry_operation(check_index_exists)
 
         # Step 1: Delete the index with retry
         def delete_pinecone_index():
-            pinecone.delete_index(index_name)
+            pc.delete_index(index_name)
             logger.info(f"Pinecone index '{index_name}' successfully deleted.")
         retry_operation(delete_pinecone_index)
 
