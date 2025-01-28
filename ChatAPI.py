@@ -7,6 +7,8 @@ from typing import Dict, Optional, Any
 
 import openai
 import pinecone
+from pinecone import Pinecone, ServerlessSpec
+from pinecone.exceptions import PineconeException
 from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
